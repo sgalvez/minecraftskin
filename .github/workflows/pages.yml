@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -22,18 +22,127 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
+
+      - name: Inspect or enable GitHub Pages
+        id: pages_site
+        continue-on-error: true
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/pages"
+          headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GH_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          get_status=$(curl -sS -o /tmp/pages-get.json -w "%{http_code}" "${headers[@]}" "$api")
+          action="inspect"
+          mutation_status="not-required"
+
+          if [[ "$get_status" == "404" ]]; then
+            action="create"
+            mutation_status=$(curl -sS -o /tmp/pages-mutation.json -w "%{http_code}" \
+              -X POST "${headers[@]}" \
+              -d '{"build_type":"workflow"}' \
+              "$api")
+          elif [[ "$get_status" == "200" ]]; then
+            current_build_type=$(jq -r '.build_type // "unknown"' /tmp/pages-get.json)
+            if [[ "$current_build_type" != "workflow" ]]; then
+              action="update"
+              mutation_status=$(curl -sS -o /tmp/pages-mutation.json -w "%{http_code}" \
+                -X PUT "${headers[@]}" \
+                -d '{"build_type":"workflow"}' \
+                "$api")
+            fi
+          fi
+
+          echo "get_status=$get_status" >> "$GITHUB_OUTPUT"
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "mutation_status=$mutation_status" >> "$GITHUB_OUTPUT"
+
+          if [[ "$get_status" != "200" && "$mutation_status" != "201" && "$mutation_status" != "204" ]]; then
+            echo "GitHub Pages no pudo habilitarse con GITHUB_TOKEN." >&2
+            exit 1
+          fi
 
       - name: Configure GitHub Pages
+        id: configure
+        continue-on-error: true
         uses: actions/configure-pages@v5
 
       - name: Upload static site
+        id: upload
+        if: steps.configure.outcome == 'success'
+        continue-on-error: true
         uses: actions/upload-pages-artifact@v4
         with:
           path: .
 
       - name: Deploy to GitHub Pages
         id: deployment
+        if: steps.configure.outcome == 'success' && steps.upload.outcome == 'success'
+        continue-on-error: true
         uses: actions/deploy-pages@v4
+
+      - name: Publish deployment diagnostic
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES_GET_STATUS: ${{ steps.pages_site.outputs.get_status }}
+          PAGES_ACTION: ${{ steps.pages_site.outputs.action }}
+          PAGES_MUTATION_STATUS: ${{ steps.pages_site.outputs.mutation_status }}
+          CONFIGURE_OUTCOME: ${{ steps.configure.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+          DEPLOYMENT_URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          set -euo pipefail
+          timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          jq -n \
+            --arg timestamp "$timestamp" \
+            --arg commit "$GITHUB_SHA" \
+            --arg pages_get_status "${PAGES_GET_STATUS:-unknown}" \
+            --arg pages_action "${PAGES_ACTION:-unknown}" \
+            --arg pages_mutation_status "${PAGES_MUTATION_STATUS:-unknown}" \
+            --arg configure "${CONFIGURE_OUTCOME:-skipped}" \
+            --arg upload "${UPLOAD_OUTCOME:-skipped}" \
+            --arg deploy "${DEPLOY_OUTCOME:-skipped}" \
+            --arg url "${DEPLOYMENT_URL:-}" \
+            '{timestamp:$timestamp, commit:$commit, pages:{get_status:$pages_get_status, action:$pages_action, mutation_status:$pages_mutation_status}, steps:{configure:$configure, upload:$upload, deploy:$deploy}, url:$url}' \
+            > /tmp/pages-status.json
+
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/contents/.deploy-status.json"
+          headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GH_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+          existing_sha=$(curl -sS "${headers[@]}" "$api?ref=gh-pages" | jq -r '.sha // empty')
+          encoded=$(base64 -w 0 /tmp/pages-status.json)
+          payload=$(jq -n \
+            --arg message "chore: record GitHub Pages deployment status" \
+            --arg content "$encoded" \
+            --arg branch "gh-pages" \
+            --arg sha "$existing_sha" \
+            'if $sha == "" then {message:$message,content:$content,branch:$branch} else {message:$message,content:$content,branch:$branch,sha:$sha} end')
+
+          curl -sS --fail-with-body -X PUT "${headers[@]}" -d "$payload" "$api" > /tmp/status-write.json
+
+      - name: Verify deployment
+        if: always()
+        shell: bash
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+        run: |
+          if [[ "${DEPLOY_OUTCOME:-skipped}" != "success" ]]; then
+            echo "GitHub Pages deployment did not complete successfully." >&2
+            exit 1
+          fi
