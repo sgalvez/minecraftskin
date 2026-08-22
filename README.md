@@ -31,6 +31,10 @@ python3 -m http.server 8000
 
 Luego abre `http://localhost:8000`.
 
+## Despliegue
+
+Cada cambio enviado a `main` activa el workflow oficial de GitHub Pages. Publicación solicitada el 22 de agosto de 2026.
+
 ## Licencia
 
 MIT.
